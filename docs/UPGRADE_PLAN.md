@@ -1,252 +1,544 @@
-# PolicyPilot Upgrade Plan
+# PolicyPilot — Engineering Roadmap & Architecture Decisions
 
-**Four decisions, two reversals** 
+## 1. Overview
 
-We set out to plan four upgrades: guardrails, smarter ticker detection with more data, a
-move to Databricks Foundation Models, and a choice between Databricks Agent Evaluation and
-the existing MLflow harness. Working through each one surfaced that **two of the four
-collapse into a single underlying fix**, and one original ask gets explicitly reversed. This
-document records what changed, why, and what to build in what order.
+As part of the continuous development of PolicyPilot, I identified four major areas of improvement to strengthen the application's reliability, scalability, security, and production readiness.
 
-## Status ledger
+The objective of this engineering roadmap is to evolve PolicyPilot into a governed agentic RAG application while maintaining a modular architecture, minimizing infrastructure costs, and ensuring consistency between local development and cloud deployment.
 
-| # | Original ask | Landed on | Status |
-|---|---|---|---|
-| 1 | Add guardrails — prompt injection, off-topic, and other protections | Unity AI Gateway wrapping the deployed Groq call | **Revised** |
-| 2 | Smarter ticker detection + ingest ≥25MB of data | LLM-based detection in `plan_node`; scale by breadth to ~15–20 tickers | **Confirmed** |
-| 3 | Use Databricks Foundation Models in the deployed architecture | Keep Groq everywhere — Databricks provides governance, not inference | **Reversed** |
-| 4 | Decide: Databricks Agent Evaluation vs. MLflow | Databricks Agent Evaluation, run in CI as a deploy gate; custom MLflow harness retired | **Confirmed** |
+The proposed improvements focus on:
 
-## 00. The collapse
+- AI security and centralized guardrails.
+- Intelligent company and ticker identification.
+- Regulatory document ingestion scalability.
+- LLM provider integration and governance.
+- Automated LLM evaluation and deployment quality gates.
 
-Items 1 and 3 were scoped as separate workstreams. They turned out to be the same fix,
-because of one fact about how Databricks' governance layer actually works.
+During the architectural review, I identified an opportunity to consolidate two initially independent workstreams into a single model governance solution.
 
-Unity AI Gateway — the layer that provides PII detection, content safety, and jailbreak /
-prompt-injection filtering — isn't limited to Databricks-hosted Foundation Models. It can
-also front an **External Model endpoint** that proxies to a third-party provider like Groq.
-So "get guardrails" never actually required "switch LLM providers" — it only required
-putting Databricks' gateway in front of the LLM call, whichever provider sits behind it.
+## 2. Architecture Decision Summary
 
-```mermaid
-flowchart LR
-    A["Item 1 · Guardrails<br/>'Add prompt-injection,<br/>off-topic, PII protection'"] --> C
-    B["Item 3 · LLM backend<br/>'Migrate to Databricks<br/>Foundation Models'"] --> C
-    C["🎯 One mechanism<br/><b>Unity AI Gateway</b><br/>External Model endpoint → Groq<br/>PII · Safety · Jailbreak · Custom policy"]
-```
+| ID | Engineering Objective | Selected Architecture | Decision |
+| --- | --- | --- | --- |
+| ADR-001 | AI safety and guardrails | Unity AI Gateway | Approved |
+| ADR-002 | Intelligent ticker detection | LLM-based entity resolution within LangGraph | Approved |
+| ADR-003 | Dataset scalability | Expand SEC 10-K ingestion to 15–20 companies | Approved |
+| ADR-004 | LLM infrastructure | Retain Groq behind Unity AI Gateway | Approved |
+| ADR-005 | Automated AI evaluation | Databricks Agent Evaluation integrated into CI | Approved |
+| ADR-006 | Databricks Foundation Model migration | Revisit when data residency requirements justify migration | Deferred |
 
-*Two separately-scoped items, one underlying change: wrap the existing Groq call in
-Databricks' gateway.*
+## 3. ADR-001 — Centralized AI Security and Guardrails
 
-That single finding is what produced both this document's reversal (item 3) and its
-revision (item 1) — each is detailed below with the research that led there.
+### Problem Statement
 
----
+PolicyPilot requires additional security controls to reduce risks associated with untrusted user inputs, prompt injection, inappropriate content, sensitive information, and requests outside the application's intended regulatory domain.
 
-## 01. Guardrails — **Revised**
+### Initial Approach
 
-| | |
-|---|---|
-| **Asked** | Prompt injection, off-topic, and "other necessary" guardrails. |
-| **Landed on** | All of it lives in a Unity AI Gateway External Model endpoint, deployed-only. No new LangGraph node. |
-| **Covers** | PII detection/redaction, content safety, jailbreak / prompt-injection detection (built-in categories) — plus two **custom guardrails** written as plain-language policy prompts: off-topic questions, and requests for investment/trading advice. |
-
-### Why it moved out of the agent
-
-The first plan put a new `guard_node` in front of `plan_node`, running its own LLM
-classification call. That's a reasonable pattern on its own, but once we confirmed AI
-Gateway's built-in jailbreak detector and custom-prompt guardrails cover the same ground,
-keeping a parallel implementation in the agent meant maintaining one policy in two places —
-Python code and Databricks config — that could drift out of sync. Centralizing at the
-gateway also removes an LLM round-trip from every question's latency.
-
-### What we explicitly did not adopt
-
-[Shieldstral](https://mistral.ai/news/shieldstral/), Mistral's open-weights 3B safety
-classifier, is a genuinely good technical fit for the off-topic / investment-advice checks
-— it's built exactly for policy-adaptive yes/no classification. It's parked as a future
-option because it needs its own GPU-hosted endpoint (Databricks Model Serving with a GPU),
-which is new always-on infrastructure — the same kind of billable resource this project has
-otherwise been careful to tear down between test sessions.
-
-> **Accepted gap** — Local dev (`PP_ENV=local`, raw Groq) has zero guardrails — AI Gateway
-> only sits in front of the deployed path. Treated as acceptable: local is a developer
-> sandbox, never exposed to untrusted users. See [Known gaps](#07-known-gaps) for the
-> test-coverage consequence.
-
----
-
-## 02. Ticker detection & data scale — **Confirmed**
-
-| | |
-|---|---|
-| **Asked** | Smarter ticker detection; ingest ≥25MB of data. |
-| **Landed on** | Fold detection into `plan_node`'s existing LLM call; scale data by adding companies, not history or filing types. |
-
-### Ticker detection
-
-Today's `plan_node` matches the question's words against a hardcoded
-`DEFAULT_TICKERS = ["AAPL","MSFT","JPM"]` list — exact symbol only, so "Apple" doesn't
-match but "AAPL" does. `plan_node` already makes one LLM call to rewrite the question into
-a search query; that same call will also return a detected company or ticker if one is
-named, by symbol *or* name. No new call, and it scales to however many companies get
-ingested without touching code.
-
-### Data scale — breadth over history or filing types
-
-Three ways to cross 25MB were on the table: more companies, more years per company, or more
-filing types (10-Q, 8-K) alongside the 10-Ks. Breadth won: expand `DEFAULT_TICKERS` from 3
-to roughly 15–20 well-known tickers, one 10-K each. It directly stress-tests the smarter
-detection above, and doesn't require new metadata dimensions (fiscal year disambiguation,
-filing-type schema) the other two axes would need.
-
-> **Follow-on** — `golden_dataset.jsonl` (currently 13 questions across 3 tickers) should
-> grow alongside the ticker list to keep eval coverage proportional.
-
----
-
-## 03. LLM backend — **Reversed**
-
-| | |
-|---|---|
-| **Asked** | Use Databricks Foundation Models in the deployed architecture. |
-| **Landed on** | Keep Groq as the LLM everywhere — local *and* deployed. Databricks' role becomes governance, not inference. |
-
-### The two real patterns, compared honestly
-
-**Groq + AI Gateway wrapper** optimizes for speed and provider flexibility — the same shape
-as putting LiteLLM or Portkey in front of a best-of-breed external API, which is the more
-common industry pattern outside Databricks-native shops. Groq's LPU inference is
-meaningfully faster than standard GPU-served Foundation Models.
-
-**Full Foundation Model migration** optimizes for data residency: every request, including
-retrieved 10-K text, would stay entirely inside the Databricks/Azure boundary — nothing
-leaves to a third-party API. For a product branded a "*governed* regulatory/policy
-copilot," that's not cosmetic. It's also the on-ramp to Mosaic AI Agent Framework and Model
-Serving later.
-
-### Why Groq won anyway
-
-The migration's main justification — unlocking guardrails — evaporated once External Model
-endpoints turned out to support the exact same guardrail categories as Foundation Model
-endpoints. What's left is the residency argument alone, and today's corpus is entirely
-public SEC filings with no confidentiality requirement to protect. Shipping the governance
-win now, honestly, beats migrating models for a compliance property this specific dataset
-doesn't yet need.
-
-> **Named, not dropped** — "Governed" is redefined here as *monitored and filtered*, not
-> *data never leaves our boundary*. Full Foundation Model migration stays on the table as a
-> distinct future step if the corpus or audience ever changes that calculus.
-
----
-
-## 04. Evals — **Confirmed**
-
-| | |
-|---|---|
-| **Asked** | Databricks Agent Evaluation or MLflow — pick one. |
-| **Landed on** | Databricks Agent Evaluation, run in CI, gating `cd.yml`. The custom `run_eval.py` harness is retired. |
-
-### Why not split by environment, like everything else
-
-Every other backend in this project splits cleanly by `PP_ENV` — `VectorStore` and
-`LLMClient` both swap without the agent code changing. Evals looked like a candidate for
-the same pattern: custom MLflow judge locally, Databricks Agent Evaluation once deployed.
-It's the wrong pattern here for a specific reason — an eval harness's job is to gate a
-release, and two different judges scoring the same question differently means local "pass"
-stops predicting deployed "pass." That's training/serving skew, applied to quality gates
-instead of model weights.
-
-### Why CI, not local
-
-Databricks Agent Evaluation's built-in judges (groundedness, safety, relevance, guideline
-adherence) run as Databricks-hosted models — it needs `mlflow[databricks]>=3.1` and live
-workspace connectivity, which would break the "no cloud account needed locally" promise if
-run interactively. Moving it into CI sidesteps that: interactive local dev (asking
-questions in the chat UI) stays fully offline, and the eval-as-gate concept fits CI
-naturally. The existing GitHub OIDC federation (already used by `cd.yml`) covers the
-Databricks auth — no new secret needed for that part.
-
----
-
-## 05. Target architecture
-
-The deployed request path, before this plan and after it. The only structural addition is
-the gateway hop.
+My initial approach was to introduce a dedicated security node into the LangGraph workflow.
 
 ```mermaid
 flowchart LR
-    subgraph before["BEFORE"]
-        direction LR
-        A1["Databricks App<br/>Streamlit UI"] -->|"raw GROQ_API_KEY"| A2["Groq API<br/>(external · groq.com)"]
-        A3["Key Vault<br/>secret scope"] -.-> A1
-    end
+    A[User Query] --> B[Guard Node]
+    B --> C[Plan]
+    C --> D[Retrieve]
+    D --> E[Answer]
+    E --> F[Verify]
 ```
+
+The security node would perform an additional LLM classification call before allowing a request to enter the retrieval pipeline.
+
+Although this approach provides application-level flexibility, it introduces additional inference latency and requires maintaining security policies directly within the application code.
+
+### Selected Architecture
+
+I selected Unity AI Gateway as the centralized governance layer for the deployed LLM integration.
 
 ```mermaid
 flowchart LR
-    subgraph after["AFTER"]
-        direction LR
-        B1["Databricks App<br/>Streamlit UI"] -->|"app SP auth"| B2["🆕 Unity AI Gateway<br/>External Model endpoint<br/>PII · Safety · Jailbreak<br/>Custom: off-topic · investment advice"]
-        B2 -->|"key held by Databricks"| B3["Groq API<br/>(external · groq.com)"]
-        B4["Key Vault<br/>secret scope"] -.->|"bound to endpoint, not App"| B2
-    end
+    A[PolicyPilot Application] --> B[Unity AI Gateway]
+    B --> C[Governed Model Service]
+    C --> D[Groq Provider]
+    D --> E[LLM]
 ```
 
-*The provider key moves from the App's environment to the gateway endpoint's config — app
-code no longer touches a raw Groq key at all.*
+The gateway provides a centralized location for model access policies and configurable security controls.
 
----
+### Planned Security Controls
 
-## 06. Delivery sequence
+| Security Control | Purpose |
+| --- | --- |
+| Prompt injection detection | Identify attempts to override application instructions |
+| Jailbreak detection | Identify attempts to bypass model restrictions |
+| PII detection | Identify potentially sensitive personal information |
+| Content safety | Restrict inappropriate or unsafe content |
+| Off-topic detection | Restrict requests outside the regulatory filing domain |
+| Investment-advice detection | Prevent personalized trading and investment recommendations |
+| Citation verification | Reject answers that fail the application-level citation requirement |
 
-The four items aren't independent. Build in this order to keep each step protected by the
-one before it.
+The citation verification mechanism remains within the LangGraph workflow. Gateway-level policies complement rather than replace application-level validation.
 
-1. **Item 2 first** — ticker/company detection in `plan_node` and the expanded ingestion.
-   Lowest risk, no new infrastructure, and every later step benefits from more data to test
-   against.
-2. **Item 4 second** — CI-gated Databricks Agent Evaluation, using the now-larger
-   `golden_dataset.jsonl`. Runs entirely against a freshly-rebuilt local Chroma store, so it
-   has **no dependency** on items 1 or 3 — it can ship before the gateway work even starts.
-3. **Items 1 + 3 together, last** — both resolve to the same Unity AI Gateway change, and
-   it's the highest-risk, most novel piece (a new Databricks resource type, a changed
-   deployed `LLMClient` path). By this point it's protected by the eval gate from step 2
-   before it ever reaches `cd.yml`.
+### Design Rationale
+
+Centralizing model security policies provides several architectural benefits:
+
+- Reduces duplication of security logic.
+- Simplifies policy management.
+- Avoids introducing an additional classification node into the agent.
+- Separates AI governance from business logic.
+- Supports centralized model access management.
+- Preserves the existing LLM provider integration.
+
+### Alternative Considered: Shieldstral
+
+I also considered Shieldstral, Mistral's specialized safety classification model.
+
+While it represents a suitable option for custom policy enforcement, self-hosting an additional safety model would introduce infrastructure and operational overhead.
+
+This approach remains a potential future enhancement for environments requiring dedicated application-level safety classification.
+
+## 4. ADR-002 — Intelligent Company and Ticker Resolution
+
+### Problem Statement
+
+The initial ticker detection implementation relies on exact symbol matching against a predefined list.
+
+```python
+DEFAULT_TICKERS = ["AAPL", "MSFT", "JPM"]
+```
+
+This approach correctly identifies explicit ticker symbols but does not reliably resolve natural-language company names.
+
+For example:
+
+| User Query | Initial Detection |
+| --- | --- |
+| What risks does AAPL disclose? | AAPL |
+| What risks does Apple disclose? | Not resolved |
+| What are Microsoft's revenue drivers? | Not resolved |
+| What cybersecurity risks does JPMorgan disclose? | Not resolved |
+
+This limitation becomes increasingly important as the document corpus expands.
+
+### Selected Approach
+
+I decided to integrate company identification into the existing LangGraph `plan_node`.
+
+The planner already uses an LLM to transform natural-language questions into optimized retrieval queries.
+
+Extending the existing structured output allows the planner to perform both query generation and company identification without introducing a separate LLM call.
+
+### Target Planning Output
+
+```json
+{
+  "company": "Apple Inc.",
+  "ticker": "AAPL",
+  "search_query": "Supply chain risks disclosed in the latest 10-K filing"
+}
+```
+
+### Target Workflow
+
+```mermaid
+flowchart TD
+    A[User Question] --> B[LangGraph Plan Node]
+    B --> C[Company Identification]
+    B --> D[Query Optimization]
+    C --> E[Ticker Resolution]
+    D --> F[Retrieval Parameters]
+    E --> F
+    F --> G[Company-Filtered Vector Search]
+    G --> H[Relevant Filing Context]
+```
+
+### Expected Benefits
+
+- Natural-language company identification.
+- Support for ticker symbols and company names.
+- Improved retrieval precision.
+- Reduced cross-company information contamination.
+- Improved scalability as new companies are ingested.
+- No additional dedicated LLM classification request.
+
+Ticker resolution should be validated against the available company metadata before retrieval to prevent unsupported or hallucinated ticker assignments.
+
+## 5. ADR-003 — Regulatory Dataset Scalability
+
+### Objective
+
+Expand the SEC filing corpus beyond the initial three-company dataset and target a minimum ingestion volume of 25 MB.
+
+### Scaling Strategies Considered
+
+| Strategy | Benefits | Trade-offs |
+| --- | --- | --- |
+| Add more companies | Broader industry coverage and improved entity-resolution testing | Larger ingestion and indexing workload |
+| Add historical filings | Supports historical financial analysis | Requires fiscal-year resolution |
+| Add filing types | Expands regulatory information coverage | Requires additional document-type metadata |
+| Combine all strategies | Maximum coverage | Increased architectural complexity |
+
+### Selected Strategy
+
+I selected horizontal expansion across approximately 15–20 publicly traded companies, using the latest available SEC 10-K filing for each company.
+
+This strategy directly supports the intelligent ticker-resolution improvement while keeping the existing metadata structure relatively stable.
+
+### Representative Company Coverage
+
+| Company | Ticker | Industry |
+| --- | --- | --- |
+| Apple | AAPL | Technology |
+| Microsoft | MSFT | Technology |
+| NVIDIA | NVDA | Semiconductors |
+| JPMorgan Chase | JPM | Financial Services |
+
+The final company list can be extended according to corpus coverage, ingestion size, and evaluation requirements.
+
+### Data Ingestion Architecture
+
+```mermaid
+flowchart TD
+    A[Company Universe] --> B[SEC EDGAR API]
+    B --> C[Latest 10-K Filings]
+    C --> D[HTML Extraction]
+    D --> E[Text Preprocessing]
+    E --> F[Document Chunking]
+    F --> G[Embedding Generation]
+    G --> H[Unity Catalog Delta Table]
+    H --> I[Databricks Vector Search]
+```
+
+### Evaluation Dataset Expansion
+
+The golden evaluation dataset should grow proportionally with the regulatory corpus.
+
+Additional evaluation scenarios should include:
+
+- Company-name resolution.
+- Ticker-symbol resolution.
+- Financial disclosure questions.
+- Risk factor analysis.
+- Business operations questions.
+- Cross-company retrieval isolation.
+- Unsupported questions.
+- Off-topic questions.
+- Citation and refusal behavior.
+
+The initial evaluation dataset contains 13 questions covering three companies. Expanding this dataset is part of the planned scalability work.
+
+## 6. ADR-004 — LLM Provider and Governance Strategy
+
+### Architectural Question
+
+Should PolicyPilot migrate from Groq to Databricks Foundation Models, or retain its external LLM provider while adopting Databricks-native governance?
+
+### Options Evaluated
+
+| Evaluation Criteria | Groq + Unity AI Gateway | Databricks Foundation Models |
+| --- | --- | --- |
+| Provider flexibility | High | More platform-dependent |
+| Local and cloud model consistency | Supported | Requires backend adaptation |
+| Centralized governance | Supported through gateway | Native integration |
+| Data residency | External provider processing | Potentially improved platform isolation |
+| Existing application compatibility | High | Requires migration |
+| Migration effort | Lower | Higher |
+
+### Selected Architecture
+
+I decided to retain Groq as the inference provider across both execution environments.
+
+Databricks remains responsible for the governed data, retrieval, model access, application hosting, and evaluation layers.
+
+```mermaid
+flowchart TD
+    A[PolicyPilot] --> B{Execution Environment}
+
+    B -->|Local| C[Groq API]
+    B -->|Databricks| D[Unity AI Gateway]
+
+    D --> E[Governed Model Service]
+    E --> F[Groq API]
+
+    C --> G[GPT-OSS-120B]
+    F --> G
+```
+
+### Decision Rationale
+
+The current document corpus consists of publicly available SEC regulatory filings.
+
+A full migration to Databricks-hosted Foundation Models would introduce additional engineering work without addressing an immediate confidentiality requirement for the existing corpus.
+
+Retaining Groq preserves the current inference integration and allows the project to adopt centralized governance independently of its model provider.
+
+### Data Residency Considerations
+
+The gateway does not eliminate external model processing.
+
+Prompts and retrieved regulatory context may still be transmitted to Groq for inference.
+
+Therefore, the current architecture should not be interpreted as guaranteeing that all data remains within the Azure Databricks environment.
+
+A future migration to Databricks-hosted models should be evaluated if PolicyPilot begins processing confidential, proprietary, or otherwise restricted documents.
+
+## 7. ADR-005 — Automated LLM Evaluation and Release Quality Gates
+
+### Problem Statement
+
+Traditional software tests are necessary but insufficient for evaluating an agentic RAG application.
+
+An application can execute successfully while generating irrelevant, unsupported, or unsafe responses.
+
+The evaluation architecture must therefore assess both software correctness and AI response quality.
+
+### Initial Evaluation Architecture
+
+The initial project includes a custom MLflow-based evaluation harness and a golden question dataset.
+
+Maintaining separate local and cloud evaluation mechanisms was considered but introduces a potential inconsistency: different judges may produce different quality scores for the same response.
+
+### Selected Approach
+
+I selected Databricks Agent Evaluation as the primary LLM evaluation framework, integrated into GitHub Actions.
+
+The custom evaluation harness is planned for retirement in favor of a consistent evaluation process using Databricks-hosted judges.
+
+MLflow remains part of the underlying evaluation and experiment-tracking ecosystem.
+
+### Evaluation Dimensions
+
+| Metric | Purpose |
+| --- | --- |
+| Groundedness | Evaluate whether responses are supported by retrieved context |
+| Relevance | Evaluate alignment with the user's question |
+| Safety | Identify potentially unsafe responses |
+| Guideline adherence | Evaluate compliance with application-specific instructions |
+| Citation compliance | Validate the required citation format |
+| Refusal behavior | Evaluate responses to unsupported questions |
+| Retrieval isolation | Evaluate whether the correct company's documents are retrieved |
+
+### Evaluation Pipeline
 
 ```mermaid
 flowchart LR
-    P["PR opened<br/>ci.yml"] --> L["Lint + pytest<br/>(existing)"] --> I["Ingest → fresh<br/>local Chroma"]
-    I --> R["Run golden set<br/>via agent + Groq"] --> J["Databricks Agent Eval<br/>judges via OIDC"] --> G{"Gate<br/>pass / fail"}
-    G -->|pass| D["cd.yml deploy<br/>manual dispatch"]
+    A[Golden Question Dataset] --> B[PolicyPilot Agent]
+    B --> C[Generated Responses]
+    C --> D[Databricks Agent Evaluation]
+    D --> E[Quality Metrics]
+    E --> F{Release Criteria}
+    F -->|Pass| G[Deployment Eligible]
+    F -->|Fail| H[Block Release]
 ```
 
-*Evaluation happens entirely against a local, ephemeral store — no Databricks Vector
-Search endpoint has to stay running for CI to check a PR.*
+The evaluation thresholds should be established using baseline results and adjusted according to the application's quality requirements.
 
----
+### CI Integration
 
-## 07. Known gaps
+The proposed continuous integration workflow combines deterministic software testing with AI-specific evaluation.
 
-Named rather than hidden. None of these block the plan above — they're the honest edges of
-it.
+```mermaid
+flowchart TD
+    A[Pull Request] --> B[Ruff Static Analysis]
+    B --> C[Pytest Unit Tests]
+    C --> D[Build Temporary Chroma Store]
+    D --> E[Execute Golden Dataset]
+    E --> F[Databricks Agent Evaluation]
+    F --> G{Quality Gate}
+    G -->|Pass| H[Deployment Eligible]
+    G -->|Fail| I[Pipeline Failure]
+    H --> J[GitHub Actions CD]
+    J --> K[Azure Databricks]
+```
 
-- **Guardrails have no automated test coverage.** They live entirely in AI Gateway, which
-  only applies to the deployed path; the CI eval gate (item 4) runs against local Chroma +
-  raw Groq, so it never exercises them. A small deployed-environment smoke test — known
-  injection/off-topic/investment-advice probes against the live gateway endpoint — is the
-  natural next addition, not covered by this plan.
-- **`ci.yml` needs two things it doesn't have yet:** a `GROQ_API_KEY` secret (to run the
-  agent against the golden set) and an Azure OIDC login step mirroring `cd.yml`'s (to reach
-  Databricks Agent Evaluation's hosted judges). Today `ci.yml` only runs `ruff` and
-  `pytest`, with no cloud credentials at all.
-- **Local dev stays guardrail-free by design.** Acceptable for a single-developer sandbox
-  never exposed to untrusted users — but worth re-checking if this project ever grows a
-  second local user.
-- **Full Foundation Model migration is deferred, not cancelled.** If the corpus ever
-  includes non-public or confidential material, the data-residency argument for item 3
-  comes back into play and this decision should be revisited.
+This architecture avoids maintaining a continuously running Databricks Vector Search endpoint solely for evaluation purposes.
 
----
+### Authentication and Secret Management
 
-*src/policypilot — decisions resolved via interview*
+The planned CI workflow requires:
+
+- Access to Groq for executing the golden question dataset.
+- Microsoft Entra ID authentication.
+- GitHub Actions OIDC federation.
+- Connectivity to Databricks evaluation services.
+- Secure management of required provider credentials.
+
+OIDC federation avoids the need for long-lived Azure authentication secrets in GitHub.
+
+## 8. Target System Architecture
+
+```mermaid
+flowchart TD
+    U[User] --> UI[Streamlit Databricks App]
+
+    UI --> P[LangGraph Plan Node]
+    P --> R[Company-Filtered Retrieval]
+    R --> A[Answer Generation]
+    A --> V[Citation Verification]
+    V --> O[Grounded Response or Refusal]
+
+    S[SEC EDGAR] --> I[Ingestion Pipeline]
+    I --> E[Embedding Generation]
+    E --> UC[Unity Catalog Delta Table]
+    UC --> VS[Databricks Vector Search]
+    VS --> R
+
+    P <--> GW[Unity AI Gateway]
+    A <--> GW
+    GW <--> LLM[Groq GPT-OSS-120B]
+
+    KV[Azure Key Vault] -.-> GW
+    SP[Application Service Principal] -.-> UI
+
+    CI[GitHub Actions CI] --> EV[Databricks Agent Evaluation]
+    EV --> QG[Release Quality Gate]
+    QG --> CD[GitHub Actions CD]
+    CD --> UI
+```
+
+The target architecture separates the application into dedicated engineering layers:
+
+| Layer | Responsibility |
+| --- | --- |
+| Data ingestion | Regulatory document collection and preprocessing |
+| Data governance | Unity Catalog permissions and metadata management |
+| Retrieval | Company-filtered vector search |
+| Agent orchestration | LangGraph state management and execution |
+| Model inference | Groq |
+| AI governance | Unity AI Gateway |
+| Application | Streamlit and Databricks Apps |
+| Cloud security | Azure Key Vault, Entra ID, and service principals |
+| Quality assurance | pytest, Ruff, and Databricks Agent Evaluation |
+| Delivery | GitHub Actions and Databricks Asset Bundles |
+
+## 9. Implementation Roadmap
+
+### Phase 1 — Intelligent Retrieval and Dataset Expansion
+
+**Objective:** Improve retrieval reliability and increase regulatory document coverage.
+
+Planned deliverables:
+
+- LLM-based company identification.
+- Structured planner output.
+- Ticker validation.
+- Expanded company universe.
+- SEC filing ingestion.
+- Dataset size verification.
+- Expanded golden evaluation dataset.
+
+Acceptance criteria:
+
+- Company names and ticker symbols resolve correctly.
+- Retrieval remains restricted to the intended company's documents.
+- Unsupported companies are handled appropriately.
+- Corpus ingestion reaches the defined size target.
+
+### Phase 2 — Automated Evaluation and CI Integration
+
+**Objective:** Establish a consistent quality gate before introducing additional infrastructure changes.
+
+Planned deliverables:
+
+- Databricks Agent Evaluation integration.
+- GitHub Actions evaluation workflow.
+- OIDC authentication configuration.
+- Temporary Chroma evaluation environment.
+- Evaluation metrics and release thresholds.
+- Deployment eligibility enforcement.
+
+Acceptance criteria:
+
+- Evaluation executes automatically within CI.
+- Results are captured consistently.
+- Failed quality checks prevent deployment eligibility.
+- The evaluation workflow does not require a persistent Vector Search endpoint.
+
+### Phase 3 — Centralized Model Governance
+
+**Objective:** Introduce a governed cloud inference path without migrating the underlying LLM provider.
+
+Planned deliverables:
+
+- Unity AI Gateway integration.
+- Governed model provider and model service configuration.
+- Secure provider credential management.
+- Application service principal permissions.
+- Configurable security policies.
+- Updated Databricks LLM client.
+- Gateway smoke testing.
+
+Acceptance criteria:
+
+- The deployed application accesses Groq through the governed gateway.
+- The deployed application does not directly hold the Groq API key.
+- Authorized application identities can execute model requests.
+- Configured security policies are validated against representative test cases.
+
+## 10. Risk Register and Known Limitations
+
+| Risk | Impact | Mitigation |
+| --- | --- | --- |
+| Incorrect ticker resolution | Retrieval from an unintended company | Validate resolved entities against corpus metadata |
+| Cross-company retrieval contamination | Incorrect financial information | Apply company-specific retrieval filters |
+| Incomplete citation verification | Unsupported claims may pass a basic citation check | Introduce sentence-level verification and entailment checks |
+| Missing gateway test coverage | Security policy regressions may go undetected | Add deployed-environment security smoke tests |
+| External LLM processing | Data residency concerns | Reassess provider architecture for confidential datasets |
+| Evaluation differences between environments | Inconsistent release decisions | Use a centralized evaluation framework |
+| Cloud infrastructure costs | Unnecessary operational expenses | Use ephemeral evaluation resources and stop unused compute |
+| Local environment without gateway policies | Unfiltered model interactions | Restrict local mode to trusted development environments |
+
+## 11. Current Gaps
+
+The following limitations are explicitly identified within the proposed architecture:
+
+- Gateway guardrails are not exercised by the local CI evaluation pipeline.
+- Automated deployed-environment security tests remain to be implemented.
+- The existing CI workflow requires additional authentication and provider access configuration.
+- Local execution does not benefit from the deployed gateway's security policies.
+- Citation presence alone does not guarantee factual entailment or complete grounding.
+- Full data residency is not guaranteed when using an external inference provider.
+- The 25 MB corpus target requires verification after ingestion.
+- Evaluation thresholds require baseline measurement before enforcement.
+
+These limitations are documented to distinguish architectural objectives from verified implementation results.
+
+## 12. Future Engineering Improvements
+
+Following the implementation of the core roadmap, additional improvements may include:
+
+- Automated adversarial and prompt-injection testing.
+- Sentence-level citation verification.
+- Semantic entailment validation.
+- Hybrid retrieval and advanced reranking.
+- Historical SEC filing analysis.
+- Multi-company financial comparison.
+- Support for additional regulatory document types.
+- Automated incremental ingestion.
+- Model fallback and routing strategies.
+- Production observability and alerting.
+- Model latency and inference cost monitoring.
+- Automated gateway policy deployment.
+- Databricks-hosted Foundation Models for restricted datasets.
+
+## 13. Engineering Principles
+
+The architectural decisions are guided by the following principles:
+
+- Security by design.
+- Defense in depth.
+- Least-privilege access.
+- Modular and interchangeable components.
+- Provider-independent AI governance.
+- Reproducible cloud deployments.
+- Evaluation-driven development.
+- Infrastructure cost awareness.
+- Explicit documentation of architectural trade-offs.
+
+## Author
+
+**Leslie Tientcheu**
+
+AI Solutions Engineer | Agentic AI | Cloud Architecture | MLOps | AI Governance
+
+[GitHub — lesliesam96](https://github.com/lesliesam96)
