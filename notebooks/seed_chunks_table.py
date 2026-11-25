@@ -18,14 +18,14 @@ import requests
 from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 
-CATALOG = "policypilot_dev"
+CATALOG = "topsecretcatalog"
 SCHEMA = "filings"
 TABLE = f"{CATALOG}.{SCHEMA}.chunks"
 TICKERS = [
     "AAPL", "MSFT", "JPM", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JNJ", "V",
     "WMT", "CVX", "PG", "HD", "BAC", "KO", "PEP", "CSCO", "INTC", "DIS",
 ]
-USER_AGENT = "PolicyPilot research prototype <REPLACE_WITH_YOUR_EMAIL>"  # SEC requires a real contact
+USER_AGENT = "PolicyPilot research prototype noumowelesly@gmail.com"  # SEC requires a real contact
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 session = requests.Session()

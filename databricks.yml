@@ -30,11 +30,11 @@ targets:
     mode: development
     default: true
     workspace:
-      host:  <REPLACE_WITH_YOUR_WORKSPACE_URL>
+      host:  https://adb-7405618874333245.5.azuredatabricks.net
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
     variables:
       catalog: topsecretcatalog
-      admin_user: <REPLACE_WITH_YOUR_DATABRICKS_EMAIL>
+      admin_user: noumowelesly@gmail.com
 
   staging:
     mode: production
