@@ -1,6 +1,6 @@
 # PolicyPilot Upgrade Plan
 
-**Four decisions, two reversals** — 2026-09-02
+**Four decisions, two reversals** 
 
 We set out to plan four upgrades: guardrails, smarter ticker detection with more data, a
 move to Databricks Foundation Models, and a choice between Databricks Agent Evaluation and
@@ -249,4 +249,4 @@ it.
 
 ---
 
-*src/policypilot — decisions resolved via interview, 2026-09-02*
+*src/policypilot — decisions resolved via interview*
