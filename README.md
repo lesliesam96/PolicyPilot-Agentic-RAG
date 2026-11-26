@@ -112,7 +112,7 @@ The application was deployed and validated end to end on Azure Databricks on 25 
 
 ![Answer with citations](docs/images/app-answer-with-citations.png)
 
-The CI workflow (lint, tests, and Databricks Agent Evaluation) and the CD workflow (Databricks Asset Bundle deployment over OIDC) are visible in the repository's **Actions** tab.
+The CI workflow (lint, tests, and an automated evaluation with a citation quality gate) and the CD workflow (Databricks Asset Bundle deployment over OIDC) are visible in the repository's **Actions** tab.
 
 ## System Architecture
 
@@ -462,6 +462,8 @@ The evaluation dataset contains approximately 47 questions covering the ingested
 Databricks-hosted evaluation judges require authenticated workspace connectivity.
 
 The deterministic citation check can execute independently of the hosted judges.
+
+**Current status (25 November 2026).** In CI, the deterministic citation check runs and returns a score. The Databricks-hosted judges (relevance, groundedness, safety) completed without error but returned no scores, so they are not gated yet; the cause is still being investigated. A quality gate (`src/policypilot/eval/thresholds.py`) fails the CI job when a metric that does return a score falls below its minimum, and only warns when a metric is missing.
 
 ## CI/CD Architecture
 
