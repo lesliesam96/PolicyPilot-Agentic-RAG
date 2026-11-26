@@ -96,6 +96,24 @@ Gateway guardrails require a separate configuration and validation step in the d
 
 See [Upgrade Plan](docs/UPGRADE_PLAN.md) for the architectural decisions and implementation roadmap.
 
+## Deployment Evidence
+
+The application was deployed and validated end to end on Azure Databricks on 25 November 2026. The Vector Search endpoint and index were deleted and the app compute was stopped afterwards to avoid ongoing charges. They can be recreated from this repository.
+
+**Vector Search index online, with all 1,476 chunks indexed** (Delta Sync, triggered, 384 dimensions, over `topsecretcatalog.filings.chunks`):
+
+![Vector Search index online](docs/images/vector-search-index-online.png)
+
+**Databricks App running**, deployed from the Databricks Asset Bundle, with the full deployment history (packages installed, app built, app started):
+
+![Databricks App running](docs/images/databricks-app-running.png)
+
+**Grounded, cited answer** returned by the deployed app for "What are Apple's main risk factors?":
+
+![Answer with citations](docs/images/app-answer-with-citations.png)
+
+The CI workflow (lint, tests, and Databricks Agent Evaluation) and the CD workflow (Databricks Asset Bundle deployment over OIDC) are visible in the repository's **Actions** tab.
+
 ## System Architecture
 
 ```mermaid id="b9x2k4"
