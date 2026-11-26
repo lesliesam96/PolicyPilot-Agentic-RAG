@@ -15,6 +15,7 @@ same as the app), so it never depends on a live Databricks Vector Search endpoin
 from __future__ import annotations
 
 import json
+import sys
 
 import mlflow
 from mlflow.entities import Document, SpanType
@@ -23,6 +24,7 @@ from mlflow.genai.scorers import RelevanceToQuery, RetrievalGroundedness, Safety
 from policypilot.agent.graph import CITATION_RE, ask
 from policypilot.agent.llm import LLMClient, get_llm_client
 from policypilot.config import REPO_ROOT, get_settings
+from policypilot.eval.thresholds import QUALITY_THRESHOLDS, check_thresholds
 from policypilot.ingestion.pipeline import get_vector_store
 from policypilot.retrieval.base import SearchResult, VectorStore
 
@@ -95,6 +97,21 @@ def run_agent_eval() -> dict:
 
     print(f"\nQuestions evaluated: {len(data)}")
     print(results.metrics)
+
+    failures, missing = check_thresholds(results.metrics)
+    print("\nQuality gate")
+    for name, minimum in QUALITY_THRESHOLDS.items():
+        value = results.metrics.get(name)
+        shown = "n/a" if value is None else f"{value:.2f}"
+        print(f"  {name:<32} score {shown:>5}   minimum {minimum:.2f}")
+    for name in missing:
+        print(f"WARNING: metric {name!r} not found in results; not gated.")
+    if failures:
+        print("\nQuality gate FAILED:")
+        for line in failures:
+            print(f"  - {line}")
+        sys.exit(1)
+    print("Quality gate passed.")
     return results.metrics
 
 
