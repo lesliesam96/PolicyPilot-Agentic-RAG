@@ -15,6 +15,7 @@ same as the app), so it never depends on a live Databricks Vector Search endpoin
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import mlflow
@@ -56,6 +57,25 @@ class _TracedVectorStore:
         return results
 
 
+EXPERIMENT_NAME = os.environ.get("MLFLOW_EXPERIMENT_NAME", "/Shared/policypilot-eval")
+
+
+def _configure_tracking() -> None:
+    """Point MLflow at the Databricks workspace when one is configured.
+
+    MLflow picks the default LLM judge from the tracking URI: with a Databricks URI it uses the
+    Databricks-hosted judges; otherwise it falls back to an OpenAI model and, without an
+    OPENAI_API_KEY, every hosted judge fails silently and returns no score. In CI,
+    DATABRICKS_HOST is set and the azure/login step provides the credentials.
+    """
+    if os.environ.get("DATABRICKS_HOST"):
+        mlflow.set_tracking_uri("databricks")
+        mlflow.set_experiment(EXPERIMENT_NAME)
+        print(f"MLflow tracking: Databricks, experiment {EXPERIMENT_NAME}")
+    else:
+        print("MLflow tracking: local (no DATABRICKS_HOST); hosted judges will not run.")
+
+
 def load_golden_dataset() -> list[dict]:
     return [json.loads(line) for line in GOLDEN_PATH.read_text().splitlines() if line.strip()]
 
@@ -81,6 +101,8 @@ def run_agent_eval() -> dict:
     settings = get_settings()
     if not settings.groq_api_key:
         raise RuntimeError("GROQ_API_KEY is not set — required to run the agent.")
+
+    _configure_tracking()
 
     llm = get_llm_client()
     store = get_vector_store()
