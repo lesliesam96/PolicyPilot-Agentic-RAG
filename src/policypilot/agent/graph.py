@@ -21,6 +21,16 @@ from policypilot.retrieval.base import SearchResult, VectorStore
 
 CITATION_RE = re.compile(r"\[\d+\]")
 
+# The model sometimes emits citations with CJK/fullwidth brackets (e.g. 【1】, ［1］) instead of
+# ASCII [1]. The answer is fine, but CITATION_RE would miss it and the gate would wrongly
+# refuse. Normalize them to [n] before checking.
+_ALT_CITATION_RE = re.compile(r"[【\[［]\s*(\d+)\s*[】\]］]")
+
+
+def normalize_citations(text: str) -> str:
+    """Rewrite alternate-bracket citations like 【1】 to the canonical [1] form."""
+    return _ALT_CITATION_RE.sub(r"[\1]", text)
+
 PLAN_SYSTEM_PROMPT = (
     "You turn a user's question about SEC 10-K filings into a short search query "
     "for a semantic search index over filing text, and detect which company (if any) "
@@ -93,7 +103,7 @@ def build_graph(llm: LLMClient, store: VectorStore):
         return {"draft_answer": draft}
 
     def verify_node(state: AgentState) -> AgentState:
-        draft = state["draft_answer"]
+        draft = normalize_citations(state["draft_answer"])
         grounded = bool(state.get("results")) and bool(CITATION_RE.search(draft))
         final = draft if grounded else REFUSAL_MESSAGE
         return {"final_answer": final, "grounded": grounded}

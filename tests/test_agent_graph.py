@@ -81,3 +81,12 @@ def test_agent_scopes_retrieval_to_resolved_ticker():
     ask(llm, store, "What supply chain risks does Apple disclose?")
 
     assert store.last_ticker == "AAPL"
+
+
+def test_normalize_citations_converts_fullwidth_brackets():
+    from policypilot.agent.graph import CITATION_RE, normalize_citations
+
+    assert normalize_citations("Filed on February 5, 2026【1】.") == "Filed on February 5, 2026[1]."
+    assert normalize_citations("See ［2］ and [3].") == "See [2] and [3]."
+    assert CITATION_RE.search(normalize_citations("Done【12】"))
+    assert normalize_citations("No citation here.") == "No citation here."
